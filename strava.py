@@ -14,7 +14,50 @@ from dotenv import load_dotenv
 st.set_page_config(page_title="Strava Analytics Pro", layout="wide", page_icon="🏃")
 load_dotenv()
 
-# --- GESTION DE L'ÉTAT (SESSION STATE) ---
+# Configuration des zones selon vos captures
+HEART_RATE_ZONES = {
+    "Récupération": (0, 145),
+    "Aérobic (Endur.)": (146, 164),
+    "Aérobic (Puiss.)": (165, 173),
+    "Seuil": (174, 186),
+    "Endurance anaérobie": (187, 193),
+    "Anaérobie (Puiss.)": (194, 250)
+}
+
+# Palette de couleurs extraite de l'image
+ZONE_COLORS = {
+    "Récupération": "#00ced1", 
+    "Aérobic (Endur.)": "#228b22",
+    "Aérobic (Puiss.)": "#ffd700",
+    "Seuil": "#ff8c00",
+    "Endurance anaérobie": "#ff4500",
+    "Anaérobie (Puiss.)": "#ff0000",
+    "Inconnu": "#808080"
+}
+
+# Allures en minutes par km (converties en décimal pour le calcul)
+PACE_ZONES = {
+    "Récupération": (6.32, 20.0), # > 06'19"
+    "Aérobic (Endur.)": (5.25, 6.31), # 05'15" - 06'19"
+    "Aérobic (Puiss.)": (4.82, 5.24), # 04'49" - 05'14"
+    "Seuil": (4.38, 4.81), # 04'23" - 04'48"
+    "Endurance anaérobie": (3.97, 4.37), # 03'58" - 04'22"
+    "Anaérobie (Puiss.)": (0.0, 3.96) # < 03'58"
+}
+def assign_hr_zone(hr):
+    if pd.isna(hr): return "Inconnu"
+    for zone, (mini, maxi) in HEART_RATE_ZONES.items():
+        if mini <= hr <= maxi:
+            return zone
+    return "Inconnu"
+
+def assign_pace_zone(pace):
+    if pd.isna(pace): return "Inconnu"
+    for zone, (mini, maxi) in PACE_ZONES.items():
+        # Attention l'allure est inverse (plus petit = plus rapide)
+        if mini <= pace <= maxi:
+            return zone
+    return "Inconnu"
 
 # 1. Joueur A (Principal) - Charge depuis .env (VOTRE_...)
 if 'client_id' not in st.session_state:
@@ -81,6 +124,7 @@ def get_activities(access_token):
         page += 1
     return all_activities
 
+
 def get_athlete_profile(access_token):
     """Récupère le prénom de l'athlète pour l'affichage"""
     url = f'{BASE_URL}/athlete'
@@ -132,11 +176,19 @@ def process_data(activities):
         
     df = pd.DataFrame(data)
     df['date'] = pd.to_datetime(df['date'])
-    df['year'] = df['date'].dt.year
-    df['month_year'] = df['date'].dt.to_period('M').astype(str)
     
-    # Calcul du Pace (min/km) pour Course et Trail
+    # Calculs Marathon
     df['pace_decimal'] = (1 / df['avg_speed_kmh'].replace(0, np.nan)) * 60
+    # Ratio Efficacité (BPM par km/h) -> Plus il est bas, plus vous êtes efficace
+    df['efficiency_ratio'] = df['avg_heartrate'] / df['avg_speed_kmh'].replace(0, np.nan)
+    
+    # Assignation des zones
+    df['hr_zone'] = df['avg_heartrate'].apply(assign_hr_zone)
+    df['pace_zone'] = df['pace_decimal'].apply(assign_pace_zone)
+    
+    # Groupements temporels
+    df['week_year'] = df['date'].dt.strftime('%Y-w%V')
+    df['month_year'] = df['date'].dt.to_period('M').astype(str)
     
     return df
 
@@ -273,6 +325,14 @@ def show_dashboard():
 
         # --- TAB 1, 2, 3, 4 : INCHANGÉS ---
         with tab1:
+            st.subheader("📅 Volume Hebdomadaire")
+            # Groupement par semaine et zone pour appliquer la palette de couleurs
+            weekly_dist = df_filtered.groupby(['week_year', 'hr_zone'])['distance_km'].sum().reset_index()
+            fig_weekly = px.bar(weekly_dist, x='week_year', y='distance_km', 
+                                title="Volume kilométrique par zone"
+                                )
+            st.plotly_chart(fig_weekly, use_container_width=True)
+
             col1, col2 = st.columns(2)
             with col1:
                 monthly = df_filtered.groupby('month_year')['distance_km'].sum().reset_index()
@@ -301,6 +361,30 @@ def show_dashboard():
             st.plotly_chart(fig_bub, width='stretch')
 
         with tab2:
+            st.subheader("📉 Analyse Cardio et Tendance")
+            df_hr_clean = df_filtered.dropna(subset=['avg_heartrate']).sort_values('date')
+            
+            if not df_hr_clean.empty:
+                col1, col2 = st.columns(2)
+                with col1:
+                    # Ajout de la droite de tendance (OLS)
+                    fig_eff = px.scatter(df_hr_clean, x='date', y='efficiency_ratio',
+                                    title="Ratio BPM sur Vitesse avec tendance",
+                                    trendline="ols")
+                    # Mise à jour pour garder les lignes de connexion entre les points réels
+                    fig_eff.data[0].update(mode='lines+markers')
+                    st.plotly_chart(fig_eff, use_container_width=True)
+                with col2:
+                    zone_counts = df_hr_clean['hr_zone'].value_counts().reset_index()
+                    fig_pie = px.pie(zone_counts, values='count', names='hr_zone', 
+                                    title="Répartition des Zones Cardiaques",
+                                    hole=0.4, color='hr_zone',
+                                    color_discrete_map=ZONE_COLORS)
+                    st.plotly_chart(fig_pie, use_container_width=True)
+            else:
+                st.info("Aucune donnée disponible pour le cardio")
+
+
             df_hr = df_filtered.dropna(subset=['avg_heartrate'])
             if not df_hr.empty:
                 c1, c2 = st.columns(2)
